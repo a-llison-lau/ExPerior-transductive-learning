@@ -19,8 +19,6 @@ except:
     os.environ["SDL_VIDEODRIVER"] = "dummy"
 
 
-import pdb
-
 def convert_to_dtype(tensor, dtype):
     if tensor.dtype != dtype:
         return tensor.to(dtype)
@@ -33,26 +31,35 @@ class LLMQN(nn.Module):
         self.llm = llm
         self.num_actions = num_actions
         self.config = reft_config
+        self.dtype = next(llm.parameters()).dtype
         
         if reft_config:
             self.reft_model = pyreft.get_reft_model(self.llm, reft_config)
             self.reft_model.set_device("cuda")
+            self.q_head = nn.Linear(self.reft_model.model.config.hidden_size, num_actions).to("cuda")
+            self.q_head = self.q_head.to(self.dtype)
+            for param in self.q_head.parameters():
+                param.requires_grad = False
+
         else:
             self.reft_model = None
+            self.q_head = nn.Linear(self.llm.config.hidden_size, num_actions).to("cuda")
+            self.q_head = self.q_head.to(self.dtype)
 
-        self.q_head = nn.Linear(self.llm.config.hidden_size, num_actions).to("cuda")
-
-        self.dtype = next(llm.parameters()).dtype
-        self.q_head = self.q_head.to(self.dtype)
+            # Freeze LLM parameters
+            for param in self.llm.parameters():
+                param.requires_grad = False
+            
+            # Ensure q_head parameters are trainable
+            for param in self.q_head.parameters():
+                param.requires_grad = True
 
     def forward(self, tokenized_state):
         tokenized_state = {k: v.to("cuda") for k, v in tokenized_state.items()}
         # print(f"tokenized_state: {tokenized_state}")
         
         if self.reft_model:
-            # outputs = self.reft_model(**tokenized_state, output_hidden_states=True)
-            
-            outputs = self.reft_model(tokenized_state["input_ids"], output_hidden_states=True)
+            outputs = self.reft_model(**tokenized_state, output_hidden_states=True)
         else:
             outputs = self.llm(**tokenized_state, output_hidden_states=True)
         
@@ -81,21 +88,22 @@ class ReplayMemory():
 
 # FrozeLake Deep Q-Learning
 class FrozenLakeDQL():
-    learning_rate_a = 0.001         # learning rate (alpha)
+    learning_rate_a = 1e-4         # learning rate (alpha)
     discount_factor_g = 0.9         # discount rate (gamma)    
     network_sync_rate = 10          # number of steps the agent takes before syncing the policy and target network
     replay_memory_size = 1000       # size of replay memory
     mini_batch_size = 32 # 32            # size of the training data set sampled from the replay memory
 
-    # loss_fn = nn.MSELoss()          # NN Loss function. MSE=Mean Squared Error can be swapped to something else.
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.MSELoss()          
+    # loss_fn = nn.CrossEntropyLoss()
     optimizer = None                # NN Optimizer. Initialize later.
 
-    ACTIONS = ['L','D','R','U']     # for printing 0,1,2,3 => L(eft),D(own),R(ight),U(p)
+    # ACTIONS = ['L','D','R','U']     # for printing 0,1,2,3 => L(eft),D(own),R(ight),U(p)
 
     def __init__(self, model, tokenizer, reft_config=None):
         self.model = model
-        self.model.requires_grad_(False)
+        # self.model.requires_grad_(False)
+        # count_parameters(self.model)
         self.tokenizer = tokenizer
         self.reft_config = reft_config
 
@@ -109,14 +117,12 @@ class FrozenLakeDQL():
 
         policy_dqn = LLMQN(self.model, num_actions, self.reft_config)
         target_dqn = LLMQN(self.model, num_actions, self.reft_config)
+
+        self.print_dqn(policy_dqn)
         
-        count_parameters(policy_dqn)
+        # count_parameters(policy_dqn)
 
-        # Make the target and policy networks the same (copy weights/biases from one network to the other)
         target_dqn.load_state_dict(policy_dqn.state_dict())
-
-        print('Policy (random, before training):')
-        # self.print_dqn(policy_dqn)
 
         self.optimizer = torch.optim.Adam(policy_dqn.parameters(), lr=self.learning_rate_a)
 
@@ -124,23 +130,21 @@ class FrozenLakeDQL():
 
         epsilon_history = []
 
-        # For syncing the target and policy dqn
-        step_count=0
+        step_count=0    # For syncing the target and policy dqn
         train_iter=0
-        
+        losses = []
         for i in range(num_episodes):
             # Start a new episode
             
-            state = env.reset()[0]  # Initialize to state 0
+            state = env.reset()[0]  # state 0
             terminated = False      # True when agent falls in hole or reached goal
             truncated = False       # True when agent takes more than 200 actions    
 
-            # Agent collect a trajectory
-            # Agent navigates map until it falls into hole/reaches goal (terminated), or has taken 200 actions (truncated).
+            # Agent collects a trajectory
             while(not terminated and not truncated):
                 # print(f"Current state: {state}")
 
-                # Select action based on epsilon-greedy
+                # Epsilon-greedy
                 if random.random() < epsilon:
                     # print(f"--Selecting action randomly--")
                     action = env.action_space.sample() # actions: 0=left,1=down,2=right,3=up
@@ -157,62 +161,53 @@ class FrozenLakeDQL():
                 
                 # print('-' * 30)
 
-                # Execute action
                 new_state,reward,terminated,truncated,_ = env.step(action)
 
-                # Save experience into memory
                 memory.append((state, action, new_state, reward, terminated)) 
 
-                # Move to the next state
                 state = new_state
 
-                # Increment step counter
                 step_count+=1
             
-            # Keep track of the rewards collected per episode.
             if reward == 1:
                 rewards_per_episode[i] = 1
 
-            # Check if enough experience has been collected and if at least 1 reward has been collected
+            # if enough experience has been collected and if at least 1 reward has been collected
             if len(memory) > self.mini_batch_size and np.sum(rewards_per_episode)>0:
                 mini_batch = memory.sample(self.mini_batch_size)
                 # Compute loss using policy dqn and target dqn
-                self.optimize(mini_batch, policy_dqn, target_dqn)
+                print(f"Train iteration: {train_iter}")
+                loss = self.optimize(mini_batch, policy_dqn, target_dqn)
+                losses.append(loss)
                 train_iter += 1
-                # print(f"Train iteration: {train_iter}")
 
                 # Decay epsilon
                 epsilon = max(epsilon - 1/num_episodes, 0)
                 epsilon_history.append(epsilon)
 
-                # Copy policy network to target network after a certain number of steps
+                # Copy policy network to target network
                 if step_count > self.network_sync_rate:
                     target_dqn.load_state_dict(policy_dqn.state_dict())
                     step_count=0
+                
+        self.print_dqn(policy_dqn)
 
-
-        # Close environment
         env.close()
 
-        # Save policy
-        torch.save(policy_dqn.state_dict(), "./frozen_lake_dql_reft.pt")
+        # torch.save(policy_dqn.state_dict(), "./frozen_lake_dql_reft.pt")
+        trainable_params = {'q_head': policy_dqn.q_head.state_dict()}
+        torch.save(trainable_params, "./frozen_lake_llm_q_head.pt")
 
-        # Create new graph 
-        plt.figure(1)
+        plt.figure()
+        
+        plt.title("Training loss")
+        losses = [loss.cpu().item() if torch.is_tensor(loss) else loss for loss in losses]
+        plt.plot(losses)
 
-        # Plot average rewards (Y-axis) vs episodes (X-axis)
-        sum_rewards = np.zeros(num_episodes)
-        for x in range(num_episodes):
-            sum_rewards[x] = np.sum(rewards_per_episode[max(0, x-100):(x+1)])
-        plt.subplot(121) # plot on a 1 row x 2 col grid, at cell 1
-        plt.plot(sum_rewards)
-        
-        # Plot epsilon decay (Y-axis) vs episodes (X-axis)
-        plt.subplot(122) # plot on a 1 row x 2 col grid, at cell 2
-        plt.plot(epsilon_history)
-        
-        # Save plots
-        plt.savefig('./frozen_lake_dql_reft.png')
+        if self.reft_config:
+            plt.savefig('./frozen_lake_llm_reft.png')
+        else:
+            plt.savefig('./frozen_lake_llm.png')
 
             
     # Optimize policy network
@@ -224,7 +219,6 @@ class FrozenLakeDQL():
         terminated_batch = []
         
         # Create a list for each of state, action, new_state, reward, terminated
-        
         for (state, action, new_state, reward, terminated) in mini_batch:
             state_batch.append(state)
             action_batch.append(action)
@@ -232,12 +226,12 @@ class FrozenLakeDQL():
             reward_batch.append(reward)
             terminated_batch.append(terminated)
         
-        reward_batch = torch.tensor(reward_batch, dtype=torch.float).to(self.model.device).to(torch.bfloat16)
-        terminated_batch = torch.tensor(terminated_batch, dtype=torch.float).to(self.model.device).to(torch.bfloat16)
-        new_state_batch = torch.tensor(new_state_batch, dtype=torch.float).to(self.model.device).to(torch.bfloat16)
-
+        reward_batch = torch.tensor(reward_batch, dtype=torch.bfloat16).to(self.model.device)
+        terminated_batch = torch.tensor(terminated_batch, dtype=torch.bfloat16).to(self.model.device)
+        new_state_batch = torch.tensor(new_state_batch, dtype=torch.bfloat16).to(self.model.device)
 
         # Tokenize state and new state batches
+        # import pdb; pdb.set_trace()
         state_batch = [self.tokenize_state(state) for state in state_batch]
         new_state_batch = [self.tokenize_state(state) for state in new_state_batch]
 
@@ -245,30 +239,30 @@ class FrozenLakeDQL():
         state_batch = self.stack_tokenized_inputs(state_batch)
         new_state_batch = self.stack_tokenized_inputs(new_state_batch)
 
-        # print(f"Calculating q_values ..")
         q_values = policy_dqn(state_batch).gather(1, torch.tensor(action_batch).unsqueeze(-1).to(self.model.device)).squeeze()
         # print(f"q_values: {q_values}")
-        with torch.no_grad():
-            # print(f"Calculating target_q_values ..")
-            # Bellman equation Q learning
+        with torch.no_grad():   # do not compute gradients for target
+            # Q learning
             target_q_values = reward_batch + (1 - terminated_batch) * self.discount_factor_g * target_dqn(new_state_batch).max(1)[0]
             target_q_values = target_q_values.to(torch.bfloat16)
             # print(f"target_q_values: {target_q_values}")
         
         loss = self.loss_fn(q_values, target_q_values)
-        print(loss)
+        print(loss.item())
         # Perform gradient descent
         self.optimizer.zero_grad()
         loss.backward()
         # import pdb; pdb.set_trace()
         self.optimizer.step()
+
+        return loss
     
 
     def tokenize_state(self, state):
-        """ Format input as 'state: {state}' and tokenize it
+        """ Format input and tokenize it.
         """
-        # state_str = f"state: {state}"
-        state_str = f"The game is frozen lake with a 4 by 4 grid. Each cell is labeled as an integer from 0 to 15. We are currently at the cell: {state}. Give me the next action so that I can reach the goal 15 as fastest as possible. left = 0\ndown = 1\nright = 2\nup = 3.\nOutput the corresponding integer"
+        state = int(state)
+        state_str = f"You are playing a game called frozen lake with a 4 by 4 grid. Each cell is labeled as an integer from 0 to 15 from top left to bottom right. You are currently at the cell: {state}. Select the next action so that you can reach cell 15 as fast as possible. left = 0\ndown = 1\nright = 2\nup = 3.\nOutput the corresponding integer."
         inputs = self.tokenizer(state_str, return_tensors="pt")
         return inputs.to(self.model.device)
     
@@ -276,33 +270,42 @@ class FrozenLakeDQL():
     def stack_tokenized_inputs(self, tokenized_inputs):
         """ Stack tokenized inputs into dictionary : input_ids, attention_mask
         """
+        import pdb; pdb.set_trace()
         input_ids = torch.cat([ti["input_ids"] for ti in tokenized_inputs], dim=0)
         attention_mask = torch.cat([ti["attention_mask"] for ti in tokenized_inputs], dim=0)
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
+    # Print DQN: state, best action, q values
     def print_dqn(self, dqn):
-        for s in range(16):
-            state = self.tokenize_state(s)
-            with torch.no_grad():
-                action = dqn(state).argmax().item()
-                # print(f'{s}: {self.ACTIONS[action]}')
+        num_states = 16
+        for state in range(16):
+            #  Format q values for printing
+            q_values = ''
+            for q in dqn(self.tokenize_state(state)).tolist()[0]:
+                q_values += "{:+.2f}".format(q) + ' ' 
+
+            best_action = dqn(self.tokenize_state(state)).argmax()
+
+            print(f'{state:02},{best_action},[{q_values}]', end=' ')         
+            if (state + 1) % 4 == 0:
+                print() # Print a newline every 4 states
 
 
 def count_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # print(f"Trainable parameters: {trainable_params} || Total parameters: {total_params}")
-    # print(f"Trainable %: {(trainable_params / total_params) * 100}")
+    print(f"Trainable parameters: {trainable_params} || Total parameters: {total_params}")
+    print(f"Trainable %: {(trainable_params / total_params) * 100}")
 
 
 if __name__ == '__main__':
-    model_name_or_path = "/model-weights/Meta-Llama-3-8B-Instruct"
+    # model_name_or_path = "/model-weights/Meta-Llama-3-8B-Instruct"
+    model_name_or_path = "Qwen/Qwen2-0.5B-Instruct"
     model = transformers.AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.bfloat16, device_map="cuda")
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_path, model_max_length=2048, padding_side="right", use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
-    # import pdb; pdb.set_trace()
 
     # Configure REFT
     reft_config = pyreft.ReftConfig(representations={
@@ -316,4 +319,5 @@ if __name__ == '__main__':
     })
 
     dql = FrozenLakeDQL(model, tokenizer, reft_config=None)
-    dql.train(num_episodes=1000)
+    dql.train(num_episodes=100)
+    # dql.test(num_episodes=5)
